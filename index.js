@@ -1,23 +1,10 @@
-const express = require('express');
-const app = express();
-
-app.use(express.json());
-
-app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Methods', 'POST');
-  res.header('Access-Control-Allow-Headers', 'Content-Type');
-  next();
-});
-
-const GRADIO_URL = 'https://sm4ll-vton-sm4ll-vton-demo.hf.space/gradio_api/call/generate';
+// ... (garde le début de ton code avec express, etc.)
 
 app.post('/api/tryon', async (req, res) => {
   try {
-    console.log("POST BODY:", req.body);
-
     const { person_url, garment_url } = req.body;
 
+    // 1. Lancement de la génération
     const postRes = await fetch(GRADIO_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -31,87 +18,30 @@ app.post('/api/tryon', async (req, res) => {
       })
     });
 
-    if (!postRes.ok) {
-      throw new Error(`Gradio POST failed: ${postRes.status}`);
-    }
+    const { event_id } = await postRes.json();
+    if (!event_id) throw new Error('No event_id');
 
-    const postData = await postRes.json();
-    console.log("POST RESPONSE:", postData);
-
-    const event_id = postData.event_id;
-    if (!event_id) {
-      throw new Error('No event_id returned');
-    }
-
-    console.log("EVENT ID:", event_id);
-
-    await new Promise(resolve => setTimeout(resolve, 5000));
-
-    const streamUrl = `${GRADIO_URL}/${event_id}`;
-    console.log("STREAM URL:", streamUrl);
-
-    const streamRes = await fetch(streamUrl);
-
-    if (!streamRes.ok) {
-      throw new Error(`Gradio GET failed: ${streamRes.status}`);
-    }
-
-    const text = await streamRes.text();
-
-    console.log("FULL STREAM:");
-    console.log(text);
-
-    if (text.includes("event: error")) {
-      throw new Error("Gradio internal error");
-    }
-
-    const lines = text.split('\n');
+    // 2. BOUCLE DE POLL (On attend la fin)
     let resultUrl = null;
-
-    for (const line of lines) {
-      if (line.includes('data:')) {
-        const payload = line.replace('data:', '').trim();
-
-        try {
-          const parsed = JSON.parse(payload);
-
-          if (Array.isArray(parsed) && parsed[0]) {
-            if (typeof parsed[0] === 'string' && parsed[0].startsWith('http')) {
-              resultUrl = parsed[0];
-            }
-
-            if (parsed[0]?.path) {
-              resultUrl = parsed[0].path;
-            }
-          }
-
-          if (typeof parsed === 'string' && parsed.startsWith('http')) {
-            resultUrl = parsed;
-          }
-
-        } catch (e) {}
+    let attempts = 0;
+    while (!resultUrl && attempts < 20) { // On essaie 20 fois
+      await new Promise(r => setTimeout(r, 2000)); // Attente 2s entre chaque essai
+      const streamRes = await fetch(`${GRADIO_URL}/${event_id}`);
+      const text = await streamRes.text();
+      
+      // On cherche si le résultat final est arrivé dans le texte
+      if (text.includes('"process_completed"')) {
+         // Logique simplifiée pour extraire l'URL
+         const match = text.match(/"url":"(https:\/\/[^"]+)"/);
+         if (match) resultUrl = match[1];
       }
+      attempts++;
     }
 
-    if (!resultUrl) {
-      throw new Error('Cannot parse result from Gradio stream');
-    }
+    if (!resultUrl) throw new Error('Result not ready or parsing failed');
 
-    res.json({
-      success: true,
-      result_url: resultUrl
-    });
-
+    res.json({ success: true, result_url: resultUrl });
   } catch (err) {
-    console.error("PROXY ERROR:", err);
-    res.status(500).json({
-      success: false,
-      error: err.message
-    });
+    res.status(500).json({ success: false, error: err.message });
   }
-});
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Proxy running on port ${PORT}`);
 });
