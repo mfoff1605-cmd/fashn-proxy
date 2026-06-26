@@ -22,26 +22,28 @@ app.post('/api/tryon', async (req, res) => {
         });
 
         const { event_id } = await postRes.json();
-        if (!event_id) throw new Error('Erreur au lancement du try-on');
+        if (!event_id) throw new Error('Erreur au lancement');
 
-        // 2. Boucle d'attente (jusqu'à 60 secondes)
+        // 2. Attente initiale de 20 secondes
+        await new Promise(r => setTimeout(r, 20000)); 
+
+        // 3. Boucle de vérification (toutes les 2 secondes)
         let resultUrl = null;
-        for (let i = 0; i < 30; i++) {
-            await new Promise(r => setTimeout(r, 2000)); // Attend 2 secondes
+        for (let i = 0; i < 20; i++) { // On essaie 20 fois (40 secondes max après les 20 premières)
             const streamRes = await fetch(`${API_BASE}/call/try_on/${event_id}`);
             const text = await streamRes.text();
             
-            // Cherche le résultat final dans le flux
             if (text.includes('process_completed')) {
                 const match = text.match(/"path":"(https:\/\/[^"]+)"/);
                 if (match) {
                     resultUrl = match[1];
-                    break;
+                    break; 
                 }
             }
+            await new Promise(r => setTimeout(r, 2000)); // Attend 2s entre chaque essai
         }
 
-        if (!resultUrl) throw new Error('Timeout: L\'IA a pris trop de temps');
+        if (!resultUrl) throw new Error('Génération trop longue ou impossible');
         
         res.json({ success: true, result_url: resultUrl });
     } catch (err) {
