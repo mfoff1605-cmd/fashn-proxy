@@ -3,22 +3,35 @@ const express = require('express');
 const app = express();
 app.use(express.json({ limit: '10mb' }));
 
-// ─── Configuration ──────────────────────────────────────────────────────────
+// ─── Configuration ────────────────────────────────────────────────────────────
 const CONFIG = {
-  API_BASE:          'https://fashn-ai-fashn-vton-1-5.hf.space/gradio_api',
-  INITIAL_WAIT_MS:   20_000,   // Attente initiale avant le premier polling
-  POLL_INTERVAL_MS:   2_000,   // Intervalle entre deux polls
-  MAX_POLL_ATTEMPTS:     30,   // 30 × 2s = 60s de polling max (total ~80s)
-  REQUEST_TIMEOUT_MS: 15_000,  // Timeout par requête HTTP individuelle
-  PORT:              process.env.PORT || 3000,
+  API_BASE:           'https://fashn-ai-fashn-vton-1-5.hf.space/gradio_api',
+  INITIAL_WAIT_MS:    20_000,
+  POLL_INTERVAL_MS:    2_000,
+  MAX_POLL_ATTEMPTS:      30,   // 30 × 2s = 60s de polling max après les 20s initiales
+  REQUEST_TIMEOUT_MS: 15_000,
+  JOB_TTL_MS:        600_000,  // Nettoie les jobs en mémoire après 10 min
+  PORT:               process.env.PORT || 3000,
 };
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// ─── Store en mémoire des jobs ────────────────────────────────────────────────
+// Structure : { [jobId]: { status, result_url, error, createdAt } }
+const jobs = new Map();
 
-/** Promesse résolue après `ms` millisecondes — non-bloquante (I/O event). */
+// Nettoyage périodique pour éviter les fuites mémoire
+setInterval(() => {
+  const cutoff = Date.now() - CONFIG.JOB_TTL_MS;
+  for (const [id, job] of jobs.entries()) {
+    if (job.createdAt < cutoff) {
+      jobs.delete(id);
+      console.log(`[GC] Job ${id} expiré et supprimé.`);
+    }
+  }
+}, 60_000);
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-/** fetch() avec AbortController pour couper proprement en cas de timeout. */
 async function fetchWithTimeout(url, options = {}, timeoutMs = CONFIG.REQUEST_TIMEOUT_MS) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -29,38 +42,21 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = CONFIG.REQUEST_TI
   }
 }
 
-/**
- * Extrait l'URL du résultat depuis le corps SSE/text renvoyé par Gradio.
- * Gradio renvoie des lignes "data: {...}" ; on cherche la dernière ligne
- * dont le JSON contient "process_completed" et un champ `path`.
- *
- * Stratégie :
- *  1. Chercher un bloc JSON valide contenant `process_completed`.
- *  2. Si plusieurs `path` existent, prendre la première URL https.
- */
 function extractResultUrl(rawText) {
-  // Chaque événement SSE est préfixé par "data: "
   const lines = rawText.split('\n').filter((l) => l.startsWith('data:'));
-
-  for (const line of lines.reverse()) { // parcours du plus récent au plus ancien
+  for (const line of lines.reverse()) {
     try {
-      const json = JSON.parse(line.slice(5).trim()); // retire "data:"
+      const json = JSON.parse(line.slice(5).trim());
       if (json?.msg !== 'process_completed') continue;
-
-      // Cherche récursivement une clé "path" contenant une URL
       const url = findPath(json);
       if (url) return url;
-    } catch {
-      // JSON malformé sur cette ligne → on continue
-    }
+    } catch { /* ligne mal formée, on continue */ }
   }
-
-  // Fallback : regex brute si le parsing SSE échoue (réponse non-standard)
+  // Fallback regex
   const match = rawText.match(/"path"\s*:\s*"(https:\/\/[^"]+)"/);
   return match ? match[1] : null;
 }
 
-/** Parcours récursif d'un objet pour trouver la première valeur de "path" en https. */
 function findPath(obj) {
   if (!obj || typeof obj !== 'object') return null;
   if (typeof obj.path === 'string' && obj.path.startsWith('https://')) return obj.path;
@@ -71,44 +67,18 @@ function findPath(obj) {
   return null;
 }
 
-// ─── Middleware de validation ─────────────────────────────────────────────────
-
-function validateTryOnRequest(req, res, next) {
-  const { person_url, garment_url } = req.body ?? {};
-
-  if (!person_url || typeof person_url !== 'string') {
-    return res.status(400).json({ success: false, error: 'Champ `person_url` manquant ou invalide.' });
-  }
-  if (!garment_url || typeof garment_url !== 'string') {
-    return res.status(400).json({ success: false, error: 'Champ `garment_url` manquant ou invalide.' });
-  }
-
-  // Vérification basique du format URL
-  try {
-    new URL(person_url);
-    new URL(garment_url);
-  } catch {
-    return res.status(400).json({ success: false, error: 'Les URLs fournies sont mal formées.' });
-  }
-
-  next();
+function generateJobId() {
+  return Math.random().toString(36).slice(2, 9).toUpperCase();
 }
 
-// ─── Route principale ─────────────────────────────────────────────────────────
+// ─── Worker asynchrone (tourne en arrière-plan, sans bloquer la réponse HTTP) ─
+async function runTryOnJob(jobId, person_url, garment_url) {
+  const job = jobs.get(jobId);
 
-app.post('/api/tryon', validateTryOnRequest, async (req, res) => {
-  const { person_url, garment_url } = req.body;
-  const requestId = Math.random().toString(36).slice(2, 9).toUpperCase(); // ID lisible dans les logs
-
-  console.log(`[${requestId}] ▶ Nouvelle requête try-on`);
-  console.log(`[${requestId}]   person_url  : ${person_url}`);
-  console.log(`[${requestId}]   garment_url : ${garment_url}`);
-
-  // ── Étape 1 : Lancement de la génération ───────────────────────────────────
+  // Étape 1 : Lancement
   let event_id;
   try {
-    console.log(`[${requestId}] 🚀 POST → ${CONFIG.API_BASE}/call/try_on`);
-
+    console.log(`[${jobId}] 🚀 POST → ${CONFIG.API_BASE}/call/try_on`);
     const postRes = await fetchWithTimeout(
       `${CONFIG.API_BASE}/call/try_on`,
       {
@@ -118,12 +88,7 @@ app.post('/api/tryon', validateTryOnRequest, async (req, res) => {
           data: [
             { path: person_url,  meta: { _type: 'gradio.FileData' } },
             { path: garment_url, meta: { _type: 'gradio.FileData' } },
-            'tops',  // category
-            'model', // mode
-            50,      // steps
-            1.5,     // guidance_scale
-            42,      // seed
-            true,    // nsfw_filter
+            'tops', 'model', 50, 1.5, 42, true,
           ],
         }),
       },
@@ -131,95 +96,137 @@ app.post('/api/tryon', validateTryOnRequest, async (req, res) => {
 
     if (!postRes.ok) {
       const body = await postRes.text();
-      throw new Error(`Gradio a répondu ${postRes.status}: ${body.slice(0, 200)}`);
+      throw new Error(`Gradio HTTP ${postRes.status}: ${body.slice(0, 200)}`);
     }
 
     ({ event_id } = await postRes.json());
-    if (!event_id) throw new Error('Réponse initiale de Gradio sans event_id.');
+    if (!event_id) throw new Error('Réponse initiale sans event_id.');
 
-    console.log(`[${requestId}] ✅ event_id reçu : ${event_id}`);
+    console.log(`[${jobId}] ✅ event_id : ${event_id}`);
+    job.event_id = event_id;
   } catch (err) {
-    console.error(`[${requestId}] ❌ Échec du lancement :`, err.message);
-    return res.status(502).json({ success: false, error: `Erreur de lancement : ${err.message}` });
+    console.error(`[${jobId}] ❌ Échec du lancement :`, err.message);
+    job.status = 'failed';
+    job.error   = `Erreur de lancement : ${err.message}`;
+    return;
   }
 
-  // ── Étape 2 : Attente initiale (la génération démarre côté HF) ─────────────
-  console.log(`[${requestId}] ⏳ Attente initiale de ${CONFIG.INITIAL_WAIT_MS / 1000}s…`);
+  // Étape 2 : Attente initiale
+  console.log(`[${jobId}] ⏳ Attente initiale ${CONFIG.INITIAL_WAIT_MS / 1000}s…`);
+  job.status = 'processing';
   await sleep(CONFIG.INITIAL_WAIT_MS);
 
-  // ── Étape 3 : Boucle de polling ────────────────────────────────────────────
+  // Étape 3 : Polling
   const pollUrl = `${CONFIG.API_BASE}/call/try_on/${event_id}`;
-  let resultUrl = null;
 
   for (let attempt = 1; attempt <= CONFIG.MAX_POLL_ATTEMPTS; attempt++) {
-    console.log(`[${requestId}] 🔄 Poll #${attempt}/${CONFIG.MAX_POLL_ATTEMPTS} → ${pollUrl}`);
-
+    console.log(`[${jobId}] 🔄 Poll #${attempt}/${CONFIG.MAX_POLL_ATTEMPTS}`);
     try {
-      const pollRes = await fetchWithTimeout(pollUrl, {}, CONFIG.REQUEST_TIMEOUT_MS);
+      const pollRes = await fetchWithTimeout(pollUrl);
 
-      if (!pollRes.ok) {
-        console.warn(`[${requestId}]   ⚠ HTTP ${pollRes.status} — on continue…`);
-      } else {
+      if (pollRes.ok) {
         const text = await pollRes.text();
 
         if (text.includes('process_completed')) {
-          resultUrl = extractResultUrl(text);
-
-          if (resultUrl) {
-            console.log(`[${requestId}] 🎉 Résultat prêt au poll #${attempt} : ${resultUrl}`);
-            break;
-          } else {
-            console.warn(`[${requestId}]   ⚠ process_completed détecté mais aucun path extrait. Réponse brute :`);
-            console.warn(text.slice(0, 500));
+          const url = extractResultUrl(text);
+          if (url) {
+            console.log(`[${jobId}] 🎉 Résultat au poll #${attempt} : ${url}`);
+            job.status     = 'completed';
+            job.result_url = url;
+            return;
           }
+          console.warn(`[${jobId}] ⚠ process_completed sans path. Brut :`, text.slice(0, 400));
         } else if (text.includes('process_errored')) {
-          console.error(`[${requestId}] ❌ Gradio a signalé une erreur de traitement.`);
-          return res.status(502).json({ success: false, error: 'Gradio a renvoyé process_errored.' });
+          job.status = 'failed';
+          job.error  = 'Gradio a renvoyé process_errored.';
+          console.error(`[${jobId}] ❌ process_errored`);
+          return;
         } else {
-          // Statuts intermédiaires attendus : queue_full, estimation, heartbeat…
-          const statusMatch = text.match(/"msg"\s*:\s*"([^"]+)"/);
-          const status = statusMatch ? statusMatch[1] : 'en cours';
-          console.log(`[${requestId}]   ↻ Statut : ${status}`);
+          const m = text.match(/"msg"\s*:\s*"([^"]+)"/);
+          console.log(`[${jobId}]   ↻ ${m ? m[1] : 'en cours'}`);
         }
+      } else {
+        console.warn(`[${jobId}]   ⚠ HTTP ${pollRes.status}`);
       }
     } catch (err) {
-      // Timeout réseau ou coupure transitoire → on ne plante pas, on ré-essaie
-      console.warn(`[${requestId}]   ⚠ Erreur réseau au poll #${attempt} : ${err.message}`);
+      console.warn(`[${jobId}]   ⚠ Réseau poll #${attempt} : ${err.message}`);
     }
 
-    // Pause avant le prochain poll (sauf si c'était le dernier)
-    if (attempt < CONFIG.MAX_POLL_ATTEMPTS) {
-      await sleep(CONFIG.POLL_INTERVAL_MS);
-    }
+    if (attempt < CONFIG.MAX_POLL_ATTEMPTS) await sleep(CONFIG.POLL_INTERVAL_MS);
   }
 
-  // ── Étape 4 : Réponse finale ───────────────────────────────────────────────
-  if (!resultUrl) {
-    const totalWaitSec = (CONFIG.INITIAL_WAIT_MS + CONFIG.MAX_POLL_ATTEMPTS * CONFIG.POLL_INTERVAL_MS) / 1000;
-    console.error(`[${requestId}] ⏰ Timeout : aucun résultat après ${totalWaitSec}s.`);
-    return res.status(504).json({
-      success: false,
-      error:   `Génération trop longue : aucun résultat après ${totalWaitSec}s.`,
-    });
+  const total = (CONFIG.INITIAL_WAIT_MS + CONFIG.MAX_POLL_ATTEMPTS * CONFIG.POLL_INTERVAL_MS) / 1000;
+  job.status = 'failed';
+  job.error  = `Timeout : aucun résultat après ${total}s.`;
+  console.error(`[${jobId}] ⏰ ${job.error}`);
+}
+
+// ─── Middleware de validation ─────────────────────────────────────────────────
+function validateTryOnRequest(req, res, next) {
+  const { person_url, garment_url } = req.body ?? {};
+  if (!person_url  || typeof person_url  !== 'string') return res.status(400).json({ success: false, error: '`person_url` manquant ou invalide.' });
+  if (!garment_url || typeof garment_url !== 'string') return res.status(400).json({ success: false, error: '`garment_url` manquant ou invalide.' });
+  try { new URL(person_url); new URL(garment_url); } catch {
+    return res.status(400).json({ success: false, error: 'URLs mal formées.' });
+  }
+  next();
+}
+
+// ─── Route 1 : Lancer un job (réponse immédiate < 1s) ────────────────────────
+app.post('/api/tryon', validateTryOnRequest, (req, res) => {
+  const { person_url, garment_url } = req.body;
+  const jobId = generateJobId();
+
+  jobs.set(jobId, {
+    status:    'queued',
+    result_url: null,
+    error:      null,
+    createdAt:  Date.now(),
+  });
+
+  console.log(`[${jobId}] ▶ Job créé | person=${person_url} | garment=${garment_url}`);
+
+  // Lance le worker EN ARRIÈRE-PLAN (pas de await ici)
+  runTryOnJob(jobId, person_url, garment_url).catch((err) => {
+    console.error(`[${jobId}] 💥 Erreur inattendue dans le worker :`, err);
+    const job = jobs.get(jobId);
+    if (job) { job.status = 'failed'; job.error = err.message; }
+  });
+
+  // Réponse immédiate à Bubble — aucun timeout possible
+  res.json({ success: true, job_id: jobId });
+});
+
+// ─── Route 2 : Consulter le résultat d'un job ─────────────────────────────────
+// Bubble doit appeler cette route en polling (ex. toutes les 3s) jusqu'à status !== 'queued'/'processing'
+app.get('/api/result/:jobId', (req, res) => {
+  const job = jobs.get(req.params.jobId);
+
+  if (!job) {
+    return res.status(404).json({ success: false, error: 'Job introuvable ou expiré.' });
   }
 
-  return res.json({ success: true, result_url: resultUrl });
+  // Statuts possibles : queued | processing | completed | failed
+  if (job.status === 'completed') {
+    return res.json({ success: true,  status: 'completed', result_url: job.result_url });
+  }
+  if (job.status === 'failed') {
+    return res.status(502).json({ success: false, status: 'failed', error: job.error });
+  }
+  // queued ou processing : Bubble doit re-poller
+  return res.json({ success: true, status: job.status });
 });
 
-// ─── Health-check (utile pour Render) ────────────────────────────────────────
-app.get('/health', (_req, res) => res.json({ status: 'ok' }));
+// ─── Health-check ─────────────────────────────────────────────────────────────
+app.get('/health', (_req, res) => {
+  res.json({ status: 'ok', jobs_in_memory: jobs.size });
+});
 
-// ─── Gestion des erreurs non capturées ───────────────────────────────────────
-process.on('unhandledRejection', (reason) => {
-  console.error('⚠ unhandledRejection :', reason);
-});
-process.on('uncaughtException', (err) => {
-  console.error('💥 uncaughtException :', err);
-  // Ne pas killer le process sur Render pour une erreur isolée
-});
+// ─── Sécurité processus ───────────────────────────────────────────────────────
+process.on('unhandledRejection', (reason) => console.error('⚠ unhandledRejection :', reason));
+process.on('uncaughtException',  (err)    => console.error('💥 uncaughtException :', err));
 
 // ─── Démarrage ────────────────────────────────────────────────────────────────
 app.listen(CONFIG.PORT, () => {
   console.log(`✅ Proxy prêt sur le port ${CONFIG.PORT}`);
-  console.log(`   Config : attente initiale=${CONFIG.INITIAL_WAIT_MS}ms | poll=${CONFIG.POLL_INTERVAL_MS}ms | max tentatives=${CONFIG.MAX_POLL_ATTEMPTS}`);
 });
