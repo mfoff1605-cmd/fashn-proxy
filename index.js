@@ -27,7 +27,6 @@ app.post('/api/tryon', async (req, res) => {
       segmentation_free
     } = req.body;
 
-    // STEP 1: POST to Gradio
     const postRes = await fetch(GRADIO_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -59,10 +58,8 @@ app.post('/api/tryon', async (req, res) => {
 
     console.log("EVENT ID:", event_id);
 
-    // WAIT before GET
     await new Promise(resolve => setTimeout(resolve, 7000));
 
-    // STEP 2: GET stream
     const streamUrl = `${GRADIO_URL}/${event_id}`;
     console.log("STREAM URL:", streamUrl);
 
@@ -76,6 +73,10 @@ app.post('/api/tryon', async (req, res) => {
 
     console.log("FULL STREAM:");
     console.log(text);
+
+    if (text.includes("event: error")) {
+      throw new Error("Gradio internal error");
+    }
 
     const lines = text.split('\n');
     const dataLines = [];
