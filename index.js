@@ -10,22 +10,13 @@ app.use((req, res, next) => {
   next();
 });
 
-const GRADIO_URL = 'https://merve-fashn-vton-1-5.hf.space/gradio_api/call/try_on';
+const GRADIO_URL = 'https://sm4ll-vton-sm4ll-vton-demo.hf.space/gradio_api/call/generate';
 
 app.post('/api/tryon', async (req, res) => {
   try {
     console.log("POST BODY:", req.body);
 
-    const {
-      person_url,
-      garment_url,
-      category,
-      photo_type,
-      steps,
-      guidance,
-      seed,
-      segmentation_free
-    } = req.body;
+    const { person_url, garment_url } = req.body;
 
     const postRes = await fetch(GRADIO_URL, {
       method: 'POST',
@@ -34,12 +25,8 @@ app.post('/api/tryon', async (req, res) => {
         data: [
           { path: person_url, meta: { _type: "gradio.FileData" } },
           { path: garment_url, meta: { _type: "gradio.FileData" } },
-          category,
-          photo_type,
-          steps,
-          guidance,
-          seed,
-          segmentation_free
+          "eyewear",
+          { path: person_url, meta: { _type: "gradio.FileData" } }
         ]
       })
     });
@@ -58,7 +45,7 @@ app.post('/api/tryon', async (req, res) => {
 
     console.log("EVENT ID:", event_id);
 
-    await new Promise(resolve => setTimeout(resolve, 7000));
+    await new Promise(resolve => setTimeout(resolve, 5000));
 
     const streamUrl = `${GRADIO_URL}/${event_id}`;
     console.log("STREAM URL:", streamUrl);
@@ -79,45 +66,30 @@ app.post('/api/tryon', async (req, res) => {
     }
 
     const lines = text.split('\n');
-    const dataLines = [];
-
-    for (const line of lines) {
-      console.log("LINE:", line);
-
-      if (line.includes('data:')) {
-        const payload = line.replace('data:', '').trim();
-        if (payload) dataLines.push(payload);
-      }
-    }
-
-    console.log("DATA LINES:", dataLines);
-
     let resultUrl = null;
 
-    for (let i = dataLines.length - 1; i >= 0; i--) {
-      try {
-        const parsed = JSON.parse(dataLines[i]);
-        console.log("PARSED:", parsed);
+    for (const line of lines) {
+      if (line.includes('data:')) {
+        const payload = line.replace('data:', '').trim();
 
-        if (Array.isArray(parsed) && parsed[0]) {
-          if (typeof parsed[0] === 'string' && parsed[0].startsWith('http')) {
-            resultUrl = parsed[0];
-            break;
+        try {
+          const parsed = JSON.parse(payload);
+
+          if (Array.isArray(parsed) && parsed[0]) {
+            if (typeof parsed[0] === 'string' && parsed[0].startsWith('http')) {
+              resultUrl = parsed[0];
+            }
+
+            if (parsed[0]?.path) {
+              resultUrl = parsed[0].path;
+            }
           }
 
-          if (parsed[0].path) {
-            resultUrl = parsed[0].path;
-            break;
+          if (typeof parsed === 'string' && parsed.startsWith('http')) {
+            resultUrl = parsed;
           }
-        }
 
-        if (typeof parsed === 'string' && parsed.startsWith('http')) {
-          resultUrl = parsed;
-          break;
-        }
-
-      } catch (e) {
-        console.log("PARSE FAIL:", dataLines[i]);
+        } catch (e) {}
       }
     }
 
